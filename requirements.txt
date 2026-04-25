@@ -1,0 +1,13 @@
+# Computer Vision & AI
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Web Interface
+streamlit>=1.28.0
+
+# Image utilities (used by Streamlit internally)
+Pillow>=10.0.0
+
+# HTTP polling for MJPEG single-frame endpoints
+requests>=2.31.0
