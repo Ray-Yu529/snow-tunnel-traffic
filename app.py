@@ -4,7 +4,7 @@ import cv2
 import streamlit as st
 
 import config
-from traffic_analyzer import TrafficAnalyzer, density_to_status
+from traffic_analyzer import TrafficAnalyzer, load_model
 from video_stream import VideoStream
 
 st.set_page_config(
@@ -14,6 +14,12 @@ st.set_page_config(
 )
 
 _STATUS_ICON = {"暢通": "🟢", "緩慢": "🟡", "壅塞": "🔴"}
+
+
+@st.cache_resource(show_spinner="載入 YOLOv8 模型中…")
+def get_model():
+    """Streamlit 每次互動都會重跑腳本，快取模型避免重複載入。"""
+    return load_model()
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -41,7 +47,8 @@ with st.sidebar:
         f"**密度門檻**\n\n"
         f"- 暢通：< {config.SLOW_THRESHOLD} 輛/幀\n"
         f"- 緩慢：{config.SLOW_THRESHOLD}–{config.CONGESTED_THRESHOLD - 1} 輛/幀\n"
-        f"- 壅塞：≥ {config.CONGESTED_THRESHOLD} 輛/幀\n\n"
+        f"- 壅塞：≥ {config.CONGESTED_THRESHOLD} 輛/幀\n"
+        f"（車數已依 ROI 面積正規化）\n\n"
         f"**推薦穩定**\n\n"
         f"投票視窗 {config.REC_STABLE_WINDOW} 幀 · 門檻 {int(config.REC_VOTE_THRESHOLD*100)}%\n\n"
         f"**車速估算**\n\n"
@@ -83,12 +90,13 @@ if not run:
     frame_ph.info("👈 勾選左側「▶ 開始分析」以啟動串流分析")
     st.stop()
 
-with st.spinner("載入 YOLOv8 模型中…"):
-    try:
-        analyzer = TrafficAnalyzer(left_roi=left_roi, right_roi=right_roi)
-    except RuntimeError as exc:
-        st.error(f"模型載入失敗：{exc}")
-        st.stop()
+try:
+    model = get_model()
+except RuntimeError as exc:
+    st.error(f"模型載入失敗：{exc}")
+    st.stop()
+
+analyzer = TrafficAnalyzer(model=model, left_roi=left_roi, right_roi=right_roi)
 
 stream       = VideoStream(url=stream_url)
 total_frames = 0
@@ -113,13 +121,13 @@ try:
             label=f"{li} 左線 (LEFT)",
             value=f"{metrics['left_density']:.1f} 輛/幀",
             delta=f"本幀 {metrics['left_count']} 輛",
-            help=f"近 {config.DENSITY_WINDOW} 幀滾動平均",
+            help=f"近 {config.DENSITY_WINDOW} 幀滾動平均（已依 ROI 面積正規化）",
         )
         right_metric_ph.metric(
             label=f"{ri} 右線 (RIGHT)",
             value=f"{metrics['right_density']:.1f} 輛/幀",
             delta=f"本幀 {metrics['right_count']} 輛",
-            help=f"近 {config.DENSITY_WINDOW} 幀滾動平均",
+            help=f"近 {config.DENSITY_WINDOW} 幀滾動平均（已依 ROI 面積正規化）",
         )
 
         left_speed_ph.metric(

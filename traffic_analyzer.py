@@ -34,12 +34,21 @@ def density_to_status(density: float) -> str:
     return "暢通"
 
 
+def load_model() -> YOLO:
+    """載入 YOLO 模型。app.py 以 st.cache_resource 快取此結果，避免每次重跑都重新載入。"""
+    try:
+        return YOLO(MODEL_NAME)
+    except Exception as exc:
+        raise RuntimeError(f"無法載入模型 '{MODEL_NAME}'：{exc}") from exc
+
+
 class TrafficAnalyzer:
     """
     YOLOv8 車輛偵測 + 雙車道密度分析。
 
     推薦穩定機制：
       - 密度用 DENSITY_WINDOW 幀滾動平均，減少單幀噪音
+      - 密度依 ROI 面積正規化，避免面積大的車道天生數到較多車
       - 推薦用 REC_STABLE_WINDOW 幀投票，需達 REC_VOTE_THRESHOLD 多數才切換，
         防止左右頻繁跳動
     """
@@ -48,11 +57,9 @@ class TrafficAnalyzer:
         self,
         left_roi:  Optional[list] = None,
         right_roi: Optional[list] = None,
+        model:     Optional[YOLO] = None,
     ):
-        try:
-            self.model = YOLO(MODEL_NAME)
-        except Exception as exc:
-            raise RuntimeError(f"無法載入模型 '{MODEL_NAME}'：{exc}") from exc
+        self.model = model if model is not None else load_model()
 
         self._target_set: set[str] = set(TARGET_CLASSES)
         self._target_ids: Optional[set[int]] = None
@@ -60,9 +67,17 @@ class TrafficAnalyzer:
         self._left_roi  = np.array(left_roi  or LEFT_LANE_ROI,  dtype=np.int32)
         self._right_roi = np.array(right_roi or RIGHT_LANE_ROI, dtype=np.int32)
 
-        # 密度滾動視窗
-        self._left_buf:  deque[int] = deque(maxlen=DENSITY_WINDOW)
-        self._right_buf: deque[int] = deque(maxlen=DENSITY_WINDOW)
+        # 面積正規化：兩個 ROI 面積不同，直接比較原始車數會偏向面積大的一側。
+        # 將各車道車數換算成「平均 ROI 面積下的等效車數」，密度門檻的尺度維持不變。
+        left_area  = max(cv2.contourArea(self._left_roi),  1.0)
+        right_area = max(cv2.contourArea(self._right_roi), 1.0)
+        mean_area  = (left_area + right_area) / 2.0
+        self._left_scale  = mean_area / left_area
+        self._right_scale = mean_area / right_area
+
+        # 密度滾動視窗（存放面積正規化後的等效車數）
+        self._left_buf:  deque[float] = deque(maxlen=DENSITY_WINDOW)
+        self._right_buf: deque[float] = deque(maxlen=DENSITY_WINDOW)
 
         # 推薦穩定投票視窗（"L" or "R"）
         self._rec_votes: deque[str] = deque(maxlen=REC_STABLE_WINDOW)
@@ -198,8 +213,8 @@ class TrafficAnalyzer:
         if frame_right_speeds:
             self._right_speed_buf.append(float(np.mean(frame_right_speeds)))
 
-        self._left_buf.append(left_count)
-        self._right_buf.append(right_count)
+        self._left_buf.append(left_count * self._left_scale)
+        self._right_buf.append(right_count * self._right_scale)
 
         left_density  = float(np.mean(self._left_buf))
         right_density = float(np.mean(self._right_buf))
