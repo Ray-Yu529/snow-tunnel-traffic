@@ -59,6 +59,32 @@ class VideoStream:
 
     # ── 私有：單次串流連線 ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _extract_jpegs(buf: bytes) -> tuple[list[bytes], bytes]:
+        """
+        從 byte buffer 中擷取所有完整的 JPEG（可能一次收到多幀），
+        回傳 (完整幀的 bytes 列表, 剩餘未解析完的 buffer)。純函式，不依賴網路，
+        方便單元測試。
+        """
+        frames: list[bytes] = []
+        while True:
+            start = buf.find(_SOI)
+            if start == -1:
+                return frames, b""   # 沒有 SOI，丟棄殘留資料
+
+            end = buf.find(_EOI, start + 2)
+            if end == -1:
+                # EOI 還沒到，等下一個 chunk；資料損毀導致一直等不到 EOI 時，
+                # buffer 會無上限成長，超過上限直接丟棄重新等待下一個 SOI
+                buf = buf[start:]
+                if len(buf) > _MAX_BUFFER_SIZE:
+                    logger.warning("buffer 超過 %d bytes 仍未收到 EOI，捨棄殘留資料", _MAX_BUFFER_SIZE)
+                    buf = b""
+                return frames, buf
+
+            frames.append(buf[start : end + 2])
+            buf = buf[end + 2:]
+
     def _iter_one_connection(self) -> Generator[np.ndarray, None, None]:
         """
         建立一條 MJPEG HTTP 串流連線，持續解析並 yield BGR frame。
@@ -79,26 +105,9 @@ class VideoStream:
                     continue
                 buf += chunk
 
-                # 從 buffer 中擷取所有完整的 JPEG（可能一次收到多幀）
-                while True:
-                    start = buf.find(_SOI)
-                    if start == -1:
-                        buf = b""   # 沒有 SOI，丟棄殘留資料
-                        break
-
-                    end = buf.find(_EOI, start + 2)
-                    if end == -1:
-                        # EOI 還沒到，等下一個 chunk；資料損毀導致一直等不到 EOI 時，
-                        # buffer 會無上限成長，超過上限直接丟棄重新等待下一個 SOI
-                        buf = buf[start:]
-                        if len(buf) > _MAX_BUFFER_SIZE:
-                            logger.warning("buffer 超過 %d bytes 仍未收到 EOI，捨棄殘留資料", _MAX_BUFFER_SIZE)
-                            buf = b""
-                        break
-
-                    jpg  = buf[start : end + 2]
-                    buf  = buf[end + 2:]
-                    arr  = np.frombuffer(jpg, dtype=np.uint8)
+                jpgs, buf = self._extract_jpegs(buf)
+                for jpg in jpgs:
+                    arr = np.frombuffer(jpg, dtype=np.uint8)
                     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                     if frame is not None:
                         yield frame

@@ -1,0 +1,9 @@
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+.streamlit/
+roi_overrides.json
+.vscode/
+.idea/

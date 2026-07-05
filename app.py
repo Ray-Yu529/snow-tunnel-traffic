@@ -53,7 +53,22 @@ with st.sidebar:
     st.markdown("---")
     with st.expander("ROI 座標"):
         st.json({"LEFT": left_roi, "RIGHT": right_roi})
-        st.caption("執行 `python roi_helper.py` 重新校正")
+        st.caption("執行 `python roi_helper.py` 重新校正，或直接於下方輸入座標並儲存")
+
+        with st.form(f"roi_edit_form_{direction}"):
+            st.caption("直接輸入座標並儲存（立即套用，並寫入 roi_overrides.json）")
+            edited_left, edited_right = [], []
+            for label_name, src, dst in (("LEFT", left_roi, edited_left), ("RIGHT", right_roi, edited_right)):
+                st.markdown(f"**{label_name}**")
+                for i, (px, py) in enumerate(src):
+                    c1, c2 = st.columns(2)
+                    x_new = c1.number_input(f"{label_name}[{i}] x", value=int(px), step=1, key=f"{direction}_{label_name}_{i}_x")
+                    y_new = c2.number_input(f"{label_name}[{i}] y", value=int(py), step=1, key=f"{direction}_{label_name}_{i}_y")
+                    dst.append((int(x_new), int(y_new)))
+            if st.form_submit_button("💾 儲存 ROI"):
+                config.save_roi_override(direction, edited_left, edited_right)
+                _cleanup_session()
+                st.success("已儲存，正在套用新座標…")
 
     st.markdown("---")
     st.caption(
@@ -66,16 +81,27 @@ with st.sidebar:
         f"投票視窗 {config.REC_STABLE_WINDOW} 幀 · 門檻 {int(config.REC_VOTE_THRESHOLD*100)}%\n\n"
         f"**車速估算**\n\n"
         f"滾動視窗 {config.SPEED_WINDOW} 幀 · "
-        f"校正係數 {config.PIXELS_PER_METER} px/m\n"
-        f"若數值偏差，請修改 `config.py` 的 `PIXELS_PER_METER`\n\n"
+        + (
+            "已透視校正（homography）"
+            if config.HOMOGRAPHY_BY_DIRECTION.get(direction)
+            else f"平面估算係數 {config.PIXELS_PER_METER} px/m（未透視校正，執行 `python homography_helper.py` 可提升精度）"
+        )
+        + "\n\n"
         f"**車流量**\n\n"
-        f"經過畫面中線的車輛數，換算為近 {int(config.FLOW_WINDOW_SEC)} 秒的輛/分鐘"
+        f"經過畫面中線的車輛數，換算為近 {int(config.FLOW_WINDOW_SEC)} 秒的輛/分鐘\n\n"
+        f"**停等偵測**\n\n"
+        f"連續 {int(config.STOPPED_DURATION_SEC)} 秒幾乎不動即警示\n\n"
+        f"**壅塞推播**\n\n"
+        + ("已啟用 Telegram 通知" if config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID
+           else "未設定 TELEGRAM_BOT_TOKEN/CHAT_ID，目前停用")
     )
 
 # ── 主版面 ─────────────────────────────────────────────────────────────────────
 st.title("🚇 雪隧車道即時路況分析")
 dir_label = "⬇ 南下" if "南下" in direction else "⬆ 北上"
 st.caption(f"{dir_label} · YOLOv8 車輛偵測 · 雙車道密度比較")
+
+stopped_ph = st.empty()
 
 col_video, col_panel = st.columns([3, 1], gap="medium")
 
@@ -138,7 +164,9 @@ if st.session_state.get("direction") != direction:
     if "stream" in st.session_state:
         st.session_state.stream.release()
     st.session_state.stream    = VideoStream(url=stream_url)
-    st.session_state.analyzer = TrafficAnalyzer(model=model, left_roi=left_roi, right_roi=right_roi)
+    st.session_state.analyzer = TrafficAnalyzer(
+        model=model, left_roi=left_roi, right_roi=right_roi, direction=direction,
+    )
     st.session_state.direction = direction
 
 stream   = st.session_state.stream
@@ -152,6 +180,16 @@ try:
 
         rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
         frame_ph.image(rgb, use_container_width=True)
+
+        if metrics["stopped_alerts"]:
+            lane_name = {"L": "左線", "R": "右線", None: "車道外"}
+            msgs = [
+                f"{lane_name.get(a['lane'])} 車輛已停等 {a['duration']:.0f} 秒"
+                for a in metrics["stopped_alerts"]
+            ]
+            stopped_ph.error("⚠ 偵測到停等車輛：" + "；".join(msgs))
+        else:
+            stopped_ph.empty()
 
         li = _STATUS_ICON.get(metrics["left_status"],  "⚪")
         ri = _STATUS_ICON.get(metrics["right_status"], "⚪")

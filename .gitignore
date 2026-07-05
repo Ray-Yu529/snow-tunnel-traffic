@@ -12,6 +12,12 @@ env/
 # Streamlit
 .streamlit/
 
+# 網頁 ROI 校正覆寫（執行期產生，見 config.py save_roi_override）
+roi_overrides.json
+
+# 測試快取
+.pytest_cache/
+
 # IDE
 .vscode/
 .idea/

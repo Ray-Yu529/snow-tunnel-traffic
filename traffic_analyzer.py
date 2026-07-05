@@ -10,6 +10,8 @@ from ultralytics import YOLO
 from config import (
     CONF_THRESHOLD,
     CONGESTED_THRESHOLD,
+    CONGESTION_ALERT_COOLDOWN_SEC,
+    CONGESTION_ALERT_DURATION_SEC,
     DENSITY_WINDOW,
     DEVICE,
     FLOW_LINE_RATIO,
@@ -17,6 +19,7 @@ from config import (
     HALF_PRECISION,
     HISTORY_MAX_POINTS,
     HISTORY_SAMPLE_INTERVAL_SEC,
+    HOMOGRAPHY_BY_DIRECTION,
     INFER_IMGSZ,
     LEFT_LANE_ROI,
     MODEL_NAME,
@@ -27,13 +30,17 @@ from config import (
     SLOW_THRESHOLD,
     SPEED_STALE_SEC,
     SPEED_WINDOW,
+    STOPPED_DURATION_SEC,
+    STOPPED_PIXEL_THRESHOLD,
     TARGET_CLASS_IDS,
     TARGET_CLASSES,
 )
+from notifier import send_telegram_message
 
-_LEFT_COLOR  = (50,  220,  50)
-_RIGHT_COLOR = (50,  100, 255)
-_OTHER_COLOR = (160, 160, 160)
+_LEFT_COLOR    = (50,  220,  50)
+_RIGHT_COLOR   = (50,  100, 255)
+_OTHER_COLOR   = (160, 160, 160)
+_STOPPED_COLOR = (0,   0,   255)
 
 
 def density_to_status(density: float) -> str:
@@ -68,11 +75,23 @@ class TrafficAnalyzer:
         left_roi:  Optional[list] = None,
         right_roi: Optional[list] = None,
         model:     Optional[YOLO] = None,
+        direction: Optional[str] = None,
     ):
         self.model = model if model is not None else load_model()
+        self._direction_label = direction or ""
 
         self._left_roi  = np.array(left_roi  or LEFT_LANE_ROI,  dtype=np.int32)
         self._right_roi = np.array(right_roi or RIGHT_LANE_ROI, dtype=np.int32)
+
+        # 透視校正（可選）：校正後車速估算改用透視轉換算實際距離，
+        # 未校正則退回 PIXELS_PER_METER 的平面估算（見 _world_distance）
+        homography_cfg = HOMOGRAPHY_BY_DIRECTION.get(direction) if direction else None
+        if homography_cfg:
+            img_pts   = np.array(homography_cfg["image_pts"],  dtype=np.float32)
+            world_pts = np.array(homography_cfg["world_pts"], dtype=np.float32)
+            self._homography, _ = cv2.findHomography(img_pts, world_pts)
+        else:
+            self._homography = None
 
         # 面積正規化：兩個 ROI 面積不同，直接比較原始車數會偏向面積大的一側。
         # 將各車道車數換算成「平均 ROI 面積下的等效車數」，密度門檻的尺度維持不變。
@@ -112,6 +131,13 @@ class TrafficAnalyzer:
         self._last_history_ts: float = 0.0
         self._start_ts: Optional[float] = None
 
+        # 停等偵測：track_id -> 開始「幾乎不動」的時間戳
+        self._slow_since: dict[int, float] = {}
+
+        # 壅塞推播通知狀態
+        self._congested_since: dict[str, Optional[float]] = {"L": None, "R": None}
+        self._last_alert_ts:   dict[str, Optional[float]] = {"L": None,  "R": None}
+
     @staticmethod
     def _line_y(roi: np.ndarray) -> int:
         y_min, y_max = int(roi[:, 1].min()), int(roi[:, 1].max())
@@ -122,6 +148,38 @@ class TrafficAnalyzer:
     @staticmethod
     def _in_roi(cx: float, cy: float, roi: np.ndarray) -> bool:
         return cv2.pointPolygonTest(roi, (cx, cy), False) >= 0
+
+    def _world_distance(self, p1: tuple[float, float], p2: tuple[float, float]) -> float:
+        """回傳兩點間的實際距離（公尺）。已校正透視則精確計算，否則退回
+        全畫面單一比例（PIXELS_PER_METER）的平面估算。"""
+        if self._homography is not None:
+            pts = np.array([[p1], [p2]], dtype=np.float32)
+            world = cv2.perspectiveTransform(pts, self._homography)
+            return float(math.hypot(world[0, 0, 0] - world[1, 0, 0], world[0, 0, 1] - world[1, 0, 1]))
+        return math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / PIXELS_PER_METER
+
+    def _check_congestion(self, lane: str, status: str, timestamp: float) -> None:
+        """車道持續壅塞超過 CONGESTION_ALERT_DURATION_SEC 秒即推播通知，
+        並以 CONGESTION_ALERT_COOLDOWN_SEC 節流避免重複洗版。"""
+        if status != "壅塞":
+            self._congested_since[lane] = None
+            return
+
+        if self._congested_since[lane] is None:
+            self._congested_since[lane] = timestamp
+
+        elapsed = timestamp - self._congested_since[lane]
+        if elapsed < CONGESTION_ALERT_DURATION_SEC:
+            return
+        last_alert = self._last_alert_ts[lane]
+        if last_alert is not None and timestamp - last_alert < CONGESTION_ALERT_COOLDOWN_SEC:
+            return
+
+        lane_name = "左線" if lane == "L" else "右線"
+        send_telegram_message(
+            f"🚨 雪隧{self._direction_label} {lane_name} 已持續壅塞超過 {int(elapsed)} 秒，請留意行車安全"
+        )
+        self._last_alert_ts[lane] = timestamp
 
     def _draw_rois(self, frame: np.ndarray) -> None:
         overlay = frame.copy()
@@ -206,6 +264,7 @@ class TrafficAnalyzer:
         right_types = dict.fromkeys(TARGET_CLASSES, 0)
         frame_left_speeds: list[float]  = []
         frame_right_speeds: list[float] = []
+        stopped_alerts: list[dict] = []
 
         for box in results.boxes:
             cls_id = int(box.cls[0])
@@ -217,15 +276,15 @@ class TrafficAnalyzer:
 
             in_left  = self._in_roi(cx, cy, self._left_roi)
             in_right = self._in_roi(cx, cy, self._right_roi)
+            is_stopped = False
 
-            # 計算位移速度，並偵測是否跨越車流量計數線
+            # 計算位移速度、偵測是否跨越車流量計數線、偵測是否停等
             if track_id is not None and track_id in self._prev_centroids:
                 px, py = self._prev_centroids[track_id]
                 displacement = math.hypot(cx - px, cy - py)
                 # 過濾重連後 ID 重複造成的異常跳躍（> 150 px/幀）
                 if displacement < 150:
-                    # px / 秒 / (px/m) * 3.6 = km/h
-                    speed = displacement / dt / PIXELS_PER_METER * 3.6
+                    speed = self._world_distance((px, py), (cx, cy)) / dt * 3.6
                     if in_left:
                         frame_left_speeds.append(speed)
                     elif in_right:
@@ -236,8 +295,21 @@ class TrafficAnalyzer:
                     elif in_right and (py - self._right_line_y) * (cy - self._right_line_y) < 0:
                         self._right_crossings.append(timestamp)
 
+                if displacement < STOPPED_PIXEL_THRESHOLD:
+                    self._slow_since.setdefault(track_id, timestamp)
+                else:
+                    self._slow_since.pop(track_id, None)
+
             if track_id is not None:
                 self._cur_centroids[track_id] = (cx, cy)
+                since = self._slow_since.get(track_id)
+                if since is not None and timestamp - since >= STOPPED_DURATION_SEC:
+                    is_stopped = True
+                    stopped_alerts.append({
+                        "track_id": track_id,
+                        "lane": "L" if in_left else ("R" if in_right else None),
+                        "duration": timestamp - since,
+                    })
 
             if in_left:
                 left_count += 1
@@ -249,15 +321,22 @@ class TrafficAnalyzer:
                 color = _RIGHT_COLOR
             else:
                 color = _OTHER_COLOR
+            if is_stopped:
+                color = _STOPPED_COLOR
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
             cv2.circle(annotated, (int(cx), int(cy)), 4, color, -1)
             cv2.putText(
                 annotated,
-                f"{label} {conf:.2f}",
+                f"{label} {conf:.2f}" + ("  ⚠停等" if is_stopped else ""),
                 (x1, max(y1 - 6, 14)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 1,
             )
+
+        # 清掉本幀已不存在的 track_id，避免 _slow_since 無限成長
+        self._slow_since = {
+            tid: ts for tid, ts in self._slow_since.items() if tid in self._cur_centroids
+        }
 
         # 用本幀平均速度更新滾動視窗；車道淨空超過 SPEED_STALE_SEC 秒則清空，
         # 避免畫面卡在最後一筆舊車速
@@ -289,6 +368,11 @@ class TrafficAnalyzer:
         left_flow  = len(self._left_crossings)  * (60.0 / FLOW_WINDOW_SEC)
         right_flow = len(self._right_crossings) * (60.0 / FLOW_WINDOW_SEC)
 
+        left_status  = density_to_status(left_density)
+        right_status = density_to_status(right_density)
+        self._check_congestion("L", left_status, timestamp)
+        self._check_congestion("R", right_status, timestamp)
+
         stable = self._vote_recommendation(left_density, right_density)
         recommendation = "← 左線 (LEFT)" if stable == "L" else "右線 (RIGHT) →"
 
@@ -309,14 +393,15 @@ class TrafficAnalyzer:
             "right_count":     right_count,
             "left_density":    left_density,
             "right_density":   right_density,
-            "left_status":     density_to_status(left_density),
-            "right_status":    density_to_status(right_density),
+            "left_status":     left_status,
+            "right_status":    right_status,
             "left_avg_speed":  left_avg_speed,
             "right_avg_speed": right_avg_speed,
             "left_types":      left_types,
             "right_types":     right_types,
             "left_flow":       left_flow,
             "right_flow":      right_flow,
+            "stopped_alerts":  stopped_alerts,
             "recommendation":  recommendation,
         }
 
@@ -344,3 +429,6 @@ class TrafficAnalyzer:
         self._history.clear()
         self._last_history_ts = 0.0
         self._start_ts = None
+        self._slow_since.clear()
+        self._congested_since = {"L": None, "R": None}
+        self._last_alert_ts   = {"L": None, "R": None}
