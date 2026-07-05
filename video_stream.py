@@ -26,6 +26,9 @@ _EOI = b"\xff\xd9"
 # 串流正常時每秒推送多幀；超過此秒數收不到任何資料視為連線異常，交由重連處理
 _READ_TIMEOUT = 15
 
+# 收到 SOI 卻一直等不到 EOI（資料損毀）時，buffer 無上限成長的保護上限
+_MAX_BUFFER_SIZE = 2_000_000
+
 
 class VideoStream:
     """
@@ -49,6 +52,7 @@ class VideoStream:
         self._session.headers.update({"User-Agent": "Mozilla/5.0 (CCTV Analyzer)"})
 
         self._latest: Optional[np.ndarray] = None
+        self._latest_ts: float = 0.0            # 該幀解碼完成的時間戳（perf_counter）
         self._frame_ready = threading.Event()   # 有新幀可取
         self._stop        = threading.Event()   # 要求結束（release 或重試耗盡）
         self._thread: Optional[threading.Thread] = None
@@ -84,8 +88,12 @@ class VideoStream:
 
                     end = buf.find(_EOI, start + 2)
                     if end == -1:
-                        # EOI 還沒到，等下一個 chunk
+                        # EOI 還沒到，等下一個 chunk；資料損毀導致一直等不到 EOI 時，
+                        # buffer 會無上限成長，超過上限直接丟棄重新等待下一個 SOI
                         buf = buf[start:]
+                        if len(buf) > _MAX_BUFFER_SIZE:
+                            logger.warning("buffer 超過 %d bytes 仍未收到 EOI，捨棄殘留資料", _MAX_BUFFER_SIZE)
+                            buf = b""
                         break
 
                     jpg  = buf[start : end + 2]
@@ -105,7 +113,8 @@ class VideoStream:
                 try:
                     for frame in self._iter_one_connection():
                         failures = 0   # 成功收到幀，重設失敗計數
-                        self._latest = frame
+                        self._latest    = frame
+                        self._latest_ts = time.perf_counter()
                         self._frame_ready.set()
 
                     if self._stop.is_set():
@@ -130,9 +139,11 @@ class VideoStream:
 
     # ── 公開 API ───────────────────────────────────────────────────────────────
 
-    def frames(self) -> Generator[np.ndarray, None, None]:
+    def frames(self) -> Generator[tuple[np.ndarray, float], None, None]:
         """
-        持續 yield 最新的 BGR ndarray（來不及處理的舊幀自動略過）。
+        持續 yield (最新的 BGR ndarray, 該幀解碼完成時的 perf_counter 時間戳)。
+        時間戳取自背景執行緒實際收到幀的當下，不受下游處理耗時影響，
+        供車速估算計算精確的幀間時間差。來不及處理的舊幀自動略過。
         - 伺服器關閉連線後由背景執行緒自動重連
         - 連續失敗 MAX_RETRIES 次後停止
         - Streamlit 取消 checkbox 時，runtime 會在 yield 點中斷此產生器
@@ -149,8 +160,9 @@ class VideoStream:
                 return
             self._frame_ready.clear()
             frame = self._latest
+            ts    = self._latest_ts
             if frame is not None:
-                yield frame
+                yield frame, ts
 
     def release(self):
         self._stop.set()
